@@ -14,6 +14,8 @@ export const KNOCK_LIMIT = 10;
 export const GIN_BONUS = 25;
 export const BIG_GIN_BONUS = 31;
 export const UNDERCUT_BONUS = 25;
+// safety valve: players could pass the same cards back and forth forever
+export const MAX_TURNS = 200;
 
 // ---------------------------------------------------------------------------
 // Meld generation (hand-local bitmasks, hand size <= 31)
@@ -363,7 +365,7 @@ export class GinHand {
     if (knock) {
       this.result = scoreHand(this.hands, this.turn, false);
       this.phase = 'over';
-    } else if (this.stock.length <= 2) {
+    } else if (this.stock.length <= 2 || this.turnCount >= MAX_TURNS) {
       this.result = { type: 'draw', winner: -1, points: 0 };
       this.phase = 'over';
     } else {

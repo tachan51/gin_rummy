@@ -1,7 +1,7 @@
 // Basic rules-engine tests: node tools/test.mjs
 import assert from 'node:assert/strict';
 import { deadwood, defenderResult, scoreHand, GinHand, makeRng } from '../web/js/engine.js';
-import { decide } from '../web/js/ai.js';
+import { decide, leafValue, DEFAULT_PARAMS } from '../web/js/ai.js';
 
 const S = { s: 0, h: 1, d: 2, c: 3 };
 const R = { A: 0, J: 10, Q: 11, K: 12 };
@@ -30,10 +30,15 @@ assert.equal(r.type, 'undercut');
 assert.equal(r.winner, 1);
 assert.equal(r.points, 25 + 9 - 2);
 
-// AI plays legal moves for whole hands
+// leaf value model: better own hand / worse opponent hand => higher value
+assert.ok(leafValue(5, 30, 20) > leafValue(25, 30, 20));
+assert.ok(leafValue(15, 40, 20) > leafValue(15, 8, 20));
+
+// AI plays legal moves for whole hands (fixed small search for speed)
+const FAST = { ...DEFAULT_PARAMS, timeBudget: 0, searchMin: 30, drawSearchMin: 30 };
 for (let seed = 1; seed <= 30; seed++) {
   const h = new GinHand({ dealer: seed % 2, rng: makeRng(seed) });
   let n = 0;
-  while (h.phase !== 'over') { h.apply(decide(h.view(h.turn), seed % 3 === 0 ? 'easy' : 'strong', undefined, makeRng(seed + n))); n++; assert.ok(n < 200); }
+  while (h.phase !== 'over') { h.apply(decide(h.view(h.turn), seed % 3 === 0 ? 'easy' : 'strong', FAST, makeRng(seed + n))); n++; assert.ok(n < 200); }
 }
 console.log('all tests passed');
