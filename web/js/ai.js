@@ -16,6 +16,7 @@ import { VALUE_W } from './value.js';
 import { ismctsDecide } from './ismcts.js';
 import { matchUtility } from './match-equity.js';
 import { nnValue } from './nn.js';
+import { OPP_MODEL } from './opp-model.js';
 import { VAL, suitOf, rankOf, deadwood, discardDeadwoods, defenderResult, arrange, scoreHand, shuffle, KNOCK_LIMIT, makeRng } from './engine.js';
 
 export const DEFAULT_PARAMS = {
@@ -53,6 +54,17 @@ export const DEFAULT_PARAMS = {
   uctC: 0.7, // exploration constant
   mctsScale: 25, // value scale (points) used in UCT
   mctsOppGreedy: 0, // 1: opponent nodes follow a fixed greedy policy instead of UCT
+  oppModel: 1, // 1: learned opponent-hand model (opp-model.js) instead of the hand-tuned weights
+  improveCap: 10, // max simulated stock draws used to 'improve' sampled opponent hands
+  oppSim: 0, // 1: smarter opponent discards in the simulation (see simOppTurn)
+  oppSimSlack: 2, // consider discards up to this much above the minimum deadwood
+  oppSimConn: 0.5, // penalty per own connected card when discarding a card
+  oppSimFeed: 4, // penalty per relation to cards I visibly picked up
+  oppFilter: 1, // 1: resample sampled opponent hands by how well they explain the opponent's latest play
+  filterN: 4, // candidates per sampled hand
+  filterBeta: 0.4, // discard likelihood: exp(-beta * (deadwood after the real discard - best possible))
+  filterGamma: 0.3, // declined-card likelihood: exp(-gamma * (gain - 2))
+  filterNoKnock: 0.5, // likelihood of not knocking although deadwood <= 10
   nn: 0, // 1: neural leaf value (nn.js) instead of the polynomial model
   matchAwareFrom: 0, // ... only once either player has at least this many points
   matchAware: 0, // 1: use the match score (view.match) to value outcomes by match-winning probability
@@ -70,13 +82,15 @@ export function analyze(view) {
   const oppKnown = new Set();
   const oppRejected = []; // discarded or declined by opponent
   const oppPicked = []; // ever picked from discard by opponent
+  const oppDiscards = []; // [card, opp turn index]
+  const oppDeclines = []; // [card, opp turn index] upcard passes / stock draws while a discard was available
   let oppTurns = 0, myTurns = 0;
   for (const e of view.events) {
     if (e.p === opp) {
       if (e.type === 'take') { oppKnown.add(e.card); oppPicked.push(e.card); oppTurns++; }
-      else if (e.type === 'stock') { oppTurns++; if (e.declined != null) oppRejected.push(e.declined); }
-      else if (e.type === 'discard') { oppKnown.delete(e.card); oppRejected.push(e.card); }
-      else if (e.type === 'pass') oppRejected.push(e.card);
+      else if (e.type === 'stock') { oppTurns++; if (e.declined != null) { oppRejected.push(e.declined); oppDeclines.push([e.declined, oppTurns]); } }
+      else if (e.type === 'discard') { oppKnown.delete(e.card); oppRejected.push(e.card); oppDiscards.push([e.card, oppTurns]); }
+      else if (e.type === 'pass') { oppRejected.push(e.card); oppDeclines.push([e.card, oppTurns]); }
     } else if (e.type === 'take' || e.type === 'stock') myTurns++;
   }
   for (const c of oppKnown) status[c] = 3;
@@ -106,7 +120,77 @@ export function analyze(view) {
   for (const c of unseen) { pDraw[c] = 1 - pOpp[c]; sd += pDraw[c]; }
   if (sd > 0) for (const c of unseen) pDraw[c] /= sd;
 
-  return { me, opp, status, oppKnown, unseen, pOpp, pDraw, oppTurns, myTurns, U, stockCount: view.stockCount };
+  const K = { me, opp, status, oppKnown, unseen, pOpp, pDraw, oppTurns, myTurns, U, stockCount: view.stockCount, oppDiscards, oppDeclines };
+  return K;
+}
+
+// ---------------------------------------------------------------------------
+// Learned opponent-hand model (logistic regression, tools/opp_eval.mjs + tools/fit_opp.py)
+// ---------------------------------------------------------------------------
+export const OPP_FEATURES = 19;
+/** Features of unseen card c for the opponent-hand model (index 0 = bias). */
+export function oppCardFeatures(K, c, f = new Float64Array(OPP_FEATURES)) {
+  f.fill(0);
+  const r = rankOf(c), s = suitOf(c);
+  const rel = (x) => {
+    if (rankOf(x) === r) return x === c ? -1 : 0; // same rank
+    if (suitOf(x) !== s) return -1;
+    const d = Math.abs(rankOf(x) - r);
+    return d === 1 ? 1 : d === 2 ? 2 : -1;
+  };
+  f[0] = 1;
+  for (const x of K.oppKnown) { const k = rel(x); if (k >= 0) f[1 + k] += 1; }
+  for (const [x, t] of K.oppDiscards) {
+    const k = rel(x);
+    if (k < 0) continue;
+    f[4 + k] += 1;
+    if (K.oppTurns - t <= 1) f[15 + k] += 1; // discarded on the opponent's last two turns
+  }
+  for (const [x] of K.oppDeclines) { const k = rel(x); if (k >= 0) f[7 + k] += 1; }
+  let aliveRank = 0;
+  for (let s2 = 0; s2 < 4; s2++) { const x = s2 * 13 + r; if (x !== c && (K.status[x] === 0 || K.status[x] === 3)) aliveRank++; }
+  let aliveAdj = 0;
+  for (const d of [-1, 1]) { const r2 = r + d; if (r2 >= 0 && r2 < 13) { const x = s * 13 + r2; if (K.status[x] === 0 || K.status[x] === 3) aliveAdj++; } }
+  f[10] = aliveRank / 3;
+  f[11] = aliveAdj / 2;
+  f[12] = VAL[c] / 10;
+  f[13] = K.oppTurns / 10;
+  f[14] = (VAL[c] / 10) * (K.oppTurns / 10);
+  f[18] = (r === 0 || r === 12) ? 1 : 0; // A or K: only one run neighbour
+  return f;
+}
+
+/** Replace the hand-tuned pOpp by the learned model W, normalised so that the unknown cards sum to U. */
+export function applyOppModel(K, W = OPP_MODEL) {
+  const n = K.unseen.length;
+  if (!n || !K.U) return;
+  const z = new Float64Array(n);
+  const f = new Float64Array(OPP_FEATURES);
+  const base = Math.log(K.U / Math.max(1, n - K.U + 1e-9));
+  for (let i = 0; i < n; i++) {
+    oppCardFeatures(K, K.unseen[i], f);
+    let v = base;
+    for (let j = 0; j < OPP_FEATURES; j++) v += W[j] * f[j];
+    z[i] = v;
+  }
+  // shift so that the expected number of unknown opponent cards equals U
+  let delta = 0;
+  for (let it = 0; it < 30; it++) {
+    let sum = 0, der = 0;
+    for (let i = 0; i < n; i++) { const p = 1 / (1 + Math.exp(-(z[i] + delta))); sum += p; der += p * (1 - p); }
+    const step = (K.U - sum) / Math.max(der, 1e-9);
+    delta += step;
+    if (Math.abs(step) < 1e-6) break;
+  }
+  let sd = 0;
+  for (let i = 0; i < n; i++) {
+    const c = K.unseen[i];
+    const p = 1 / (1 + Math.exp(-(z[i] + delta)));
+    K.pOpp[c] = Math.min(0.99, p);
+    K.pDraw[c] = 1 - K.pOpp[c];
+    sd += K.pDraw[c];
+  }
+  if (sd > 0) for (const c of K.unseen) K.pDraw[c] /= sd;
 }
 
 /** Probability that the opponent can use card d in a meld (set or run). */
@@ -190,7 +274,7 @@ function bestDiscard(hand11, K, P, forbidden, level, dangerCache) {
 // ---------------------------------------------------------------------------
 // Knock decision via opponent-hand sampling
 // ---------------------------------------------------------------------------
-function sampleOpponentHand(K, rng) {
+export function sampleOpponentHand(K, rng) {
   const pool = K.unseen.slice();
   const hand = [...K.oppKnown];
   // weighted sample without replacement for the unknown part
@@ -205,7 +289,7 @@ function sampleOpponentHand(K, rng) {
   };
   while (hand.length < 10 && pool.length) hand.push(take(true));
   // simulate the opponent improving the hand with extra stock draws
-  const extra = Math.min(K.oppTurns, 10);
+  const extra = Math.min(K.oppTurns, K.improveCap ?? 10);
   const out = new Int32Array(32);
   for (let t = 0; t < extra && pool.length; t++) {
     const c = take(false);
@@ -278,6 +362,19 @@ export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
   }
   if (P.nn) P = { ...P, _pile: view.discardPile };
   const K = analyze(view);
+  if (P.oppModel) applyOppModel(K, P.oppModelW || OPP_MODEL);
+  if (P.oppSim) {
+    // cards I picked from the discard pile and still hold (visible to the opponent)
+    const picks = new Set();
+    for (const e of view.events) {
+      if (e.p !== view.me) continue;
+      if (e.type === 'take') picks.add(e.card);
+      else if (e.type === 'discard') picks.delete(e.card);
+    }
+    P = { ...P, _myPicks: [...picks] };
+  }
+  if (P.improveCap != null) K.improveCap = P.improveCap;
+  if (P.oppFilter) K.filter = oppFilterInfo(view, P);
   if (P.gamma || P.threatAlpha) Object.assign(K, estimateThreat(K, P, rng));
   const dangerCache = {};
   const hand = view.hand;
@@ -418,6 +515,45 @@ const SH11 = new Array(11);
  * Simulate the opponent's turn (greedy: take the discard if it clearly helps, knock as soon as possible)
  * and return my expected net points. myHand: my 10 cards, myEval/myDW: their heuristic value / deadwood.
  */
+/** same rank, or same suit within two ranks */
+function related(a, b) {
+  if (a === b) return false;
+  const ra = a % 13, rb = b % 13;
+  if (ra === rb) return true;
+  return ((a / 13) | 0) === ((b / 13) | 0) && Math.abs(ra - rb) <= 2;
+}
+
+/**
+ * Opponent's discard in the simulation: index into h (11 cards); out = discardDeadwoods(h).
+ * Greedy (minimum deadwood, then highest card), or with P.oppSim a smarter rule.
+ */
+export function oppDiscardIdx(h, out, taken, P) {
+  let bk = -1;
+  if (P.oppSim) {
+    // among discards close to the minimum deadwood, keep connected cards
+    // and avoid feeding cards related to what I visibly picked up
+    let mn = 1e9;
+    for (let k = 0; k < 11; k++) if (h[k] !== taken && out[k] < mn) mn = out[k];
+    let bs = 1e9;
+    for (let k = 0; k < 11; k++) {
+      const c = h[k];
+      if (c === taken || out[k] > mn + P.oppSimSlack) continue;
+      let conn = 0;
+      for (let j = 0; j < 11; j++) if (j !== k && related(c, h[j])) conn++;
+      let feed = 0;
+      if (P._myPicks) for (const x of P._myPicks) if (related(c, x)) feed++;
+      const sc = out[k] + P.oppSimConn * conn + P.oppSimFeed * feed - VAL[c] * 0.01;
+      if (sc < bs) { bs = sc; bk = k; }
+    }
+    return bk;
+  }
+  for (let k = 0; k < 11; k++) {
+    if (h[k] === taken) continue;
+    if (bk < 0 || out[k] < out[bk] || (out[k] === out[bk] && VAL[h[k]] > VAL[h[bk]])) bk = k;
+  }
+  return bk;
+}
+
 export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
   const oh = oppHand;
   for (let i = 0; i < 10; i++) SH11[i] = oh[i];
@@ -434,11 +570,7 @@ export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
     SH11[10] = stock[stock.length - 1];
     discardDeadwoods(SH11, SOUT);
   }
-  let bk = -1;
-  for (let k = 0; k < 11; k++) {
-    if (SH11[k] === taken) continue;
-    if (bk < 0 || SOUT[k] < SOUT[bk] || (SOUT[k] === SOUT[bk] && VAL[SH11[k]] > VAL[SH11[bk]])) bk = k;
-  }
+  const bk = oppDiscardIdx(SH11, SOUT, taken, P);
   const oppDW = SOUT[bk];
   const x = SH11[bk];
   const stockLeft = stock.length - (taken < 0 ? 1 : 0);
@@ -471,8 +603,69 @@ export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
   return P.util ? P.util.leaf(lv) : lv;
 }
 
+/**
+ * Likelihood of the opponent's latest observed behaviour given a candidate hand H (10 cards):
+ * the last discard d (H + d before discarding), the last declined discard x, and not knocking.
+ */
+const FOUT = new Int32Array(32);
+const FH = new Array(11);
+function behaviourLikelihood(H, F) {
+  let L = 1;
+  if (F.lastDiscard >= 0) {
+    for (let i = 0; i < 10; i++) FH[i] = H[i];
+    FH[10] = F.lastDiscard;
+    discardDeadwoods(FH, FOUT);
+    let mn = 1e9;
+    for (let k = 0; k < 11; k++) if (FH[k] !== F.lastTaken && FOUT[k] < mn) mn = FOUT[k];
+    L *= Math.exp(-F.beta * (FOUT[10] - mn));
+  }
+  const dw = deadwood(H);
+  if (F.lastDeclined >= 0) {
+    for (let i = 0; i < 10; i++) FH[i] = H[i];
+    FH[10] = F.lastDeclined;
+    discardDeadwoods(FH, FOUT);
+    let m = 1e9;
+    for (let k = 0; k < 10; k++) if (FOUT[k] < m) m = FOUT[k];
+    const gain = dw - m;
+    if (gain > 2) L *= Math.exp(-F.gamma * (gain - 2));
+  }
+  if (dw <= KNOCK_LIMIT) L *= dw === 0 ? F.noKnock * F.noKnock : F.noKnock;
+  return L;
+}
+
+/** Sample an opponent hand; with K.filter, resample candidates by how well they explain the opponent's play. */
+function sampleOppFiltered(K, rng) {
+  const F = K.filter;
+  if (!F) return sampleOpponentHand(K, rng);
+  const cands = [], ws = [];
+  let tot = 0;
+  for (let i = 0; i < F.n; i++) {
+    const h = sampleOpponentHand(K, rng);
+    const w = behaviourLikelihood(h, F);
+    cands.push(h); ws.push(w); tot += w;
+  }
+  let x = rng() * tot;
+  for (let i = 0; i < cands.length; i++) { x -= ws[i]; if (x <= 0) return cands[i]; }
+  return cands[cands.length - 1];
+}
+
+/** Information about the opponent's latest turn, used by the sampling filter. */
+export function oppFilterInfo(view, P) {
+  const opp = 1 - view.me;
+  let lastDiscard = -1, lastTaken = -1, lastDeclined = -1;
+  // walk back to the opponent's latest turn
+  for (let i = view.events.length - 1; i >= 0; i--) {
+    const e = view.events[i];
+    if (e.p !== opp) { if (lastDiscard >= 0) break; continue; }
+    if (e.type === 'discard') { if (lastDiscard >= 0) break; lastDiscard = e.card; }
+    else if (e.type === 'take') { lastTaken = e.card; break; }
+    else if (e.type === 'stock') { if (e.declined != null) lastDeclined = e.declined; break; }
+  }
+  return { lastDiscard, lastTaken, lastDeclined, n: P.filterN, beta: P.filterBeta, gamma: P.filterGamma, noKnock: P.filterNoKnock };
+}
+
 export function sampleWorld(K, rng) {
-  const opp = sampleOpponentHand(K, rng);
+  const opp = sampleOppFiltered(K, rng);
   const inOpp = new Set(opp);
   const stock = shuffle(K.unseen.filter((c) => !inOpp.has(c)), rng);
   return { opp, stock };
@@ -610,7 +803,7 @@ export function decideGreedy(view, rng = Math.random, noise = 0) {
 }
 
 /** Settings for the "normal" level: the first-release strong AI (heuristic only, no search). */
-export const NORMAL_OVERRIDES = { search: 0, knockChoice: 0, mcts: 0 };
+export const NORMAL_OVERRIDES = { search: 0, knockChoice: 0, mcts: 0, oppModel: 0, oppFilter: 0 };
 
 /**
  * level: 'strong' (search + learned value model), 'normal' (heuristic, the former strongest AI),
