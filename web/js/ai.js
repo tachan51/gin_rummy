@@ -15,6 +15,7 @@
 import { VALUE_W } from './value.js';
 import { ismctsDecide } from './ismcts.js';
 import { matchUtility } from './match-equity.js';
+import { nnValue } from './nn.js';
 import { VAL, suitOf, rankOf, deadwood, discardDeadwoods, defenderResult, arrange, scoreHand, shuffle, KNOCK_LIMIT, makeRng } from './engine.js';
 
 export const DEFAULT_PARAMS = {
@@ -52,6 +53,7 @@ export const DEFAULT_PARAMS = {
   uctC: 0.7, // exploration constant
   mctsScale: 25, // value scale (points) used in UCT
   mctsOppGreedy: 0, // 1: opponent nodes follow a fixed greedy policy instead of UCT
+  nn: 0, // 1: neural leaf value (nn.js) instead of the polynomial model
   matchAwareFrom: 0, // ... only once either player has at least this many points
   matchAware: 0, // 1: use the match score (view.match) to value outcomes by match-winning probability
   gamma: 0.0, // extra deadwood weight * threat (defence)
@@ -274,6 +276,7 @@ export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
     const m = view.match;
     P = { ...P, util: matchUtility(m.myScore, m.oppScore, m.target, view.dealer === view.me) };
   }
+  if (P.nn) P = { ...P, _pile: view.discardPile };
   const K = analyze(view);
   if (P.gamma || P.threatAlpha) Object.assign(K, estimateThreat(K, P, rng));
   const dangerCache = {};
@@ -447,6 +450,16 @@ export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
     return P.util ? P.util(v) : v;
   }
   if (stockLeft <= 2) return P.util ? P.util(0) : 0;
+  if (P.nn) {
+    // neural leaf value (nn.js): position at the start of my next turn
+    const rest = [];
+    for (let k = 0; k < 11; k++) if (k !== bk) rest.push(SH11[k]);
+    const dead = P._pile ? P._pile.slice() : [];
+    if (taken < 0) dead.push(top);
+    dead.push(x);
+    const lv = (P.nnModel || nnValue)(myHand, rest, dead, x, stockLeft, myEval, myDW, oppDW);
+    return P.util ? P.util.leaf(lv) : lv;
+  }
   // my next turn: I may take the opponent's discard x
   for (let i = 0; i < 10; i++) SH11[i] = myHand[i];
   SH11[10] = x;
