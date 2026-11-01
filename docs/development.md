@@ -9,6 +9,7 @@
 | `web/js/ai.js` | AI（最強＝探索あり / ふつう＝ヒューリスティックのみ / よわい＝貪欲）。しくみは [algo.md](algo.md) |
 | `web/js/ismcts.js` | ISMCTS（オプション。既定では無効） |
 | `web/js/match-equity.js`, `web/js/hand-outcomes.js` | マッチエクイティ表と、その元になるハンド結果の分布（オプション） |
+| `web/js/nn.js`, `web/js/nn-value.js` | ニューラルネットの局面評価の推論と重み（オプション） |
 | `web/js/value.js` | 探索で使う局面評価モデルの係数（自動生成） |
 | `web/js/ai-worker.js` | AI を Web Worker で動かすための入口 |
 | `web/js/ui.js` | 画面の制御 |
@@ -16,6 +17,7 @@
 | `tools/selfplay.mjs` | AI 同士の自己対戦。結果は [history.md](history.md) |
 | `tools/match.mjs` | 100点先取のマッチ単位の自己対戦（マッチ勝率と95%信頼区間） |
 | `tools/gen_outcomes.mjs` | ハンド結果の分布の生成 |
+| `tools/gen_nn.mjs`, `tools/train_nn.py` | ニューラルネット用の学習データ生成と学習（numpy） |
 | `tools/sweep.sh` | パラメータ違いの自己対戦を並列実行 |
 | `tools/baseline/ai_v1.js` | 初版の最強AI（比較用に凍結。レベル名 `v1`） |
 | `tools/gen_value.mjs`, `tools/fit_value.py` | 局面評価モデルの学習データ生成と当てはめ |
@@ -72,6 +74,18 @@ python3 tools/fit_value.py /tmp/vdata
 ```
 
 `gen_value.mjs` は最強AI同士で対戦し、各手番開始時の局面（自分の評価値・相手のデッドウッド・山札枚数）と、そのハンドの最終得点を書き出します。複数の seed で並列に実行してから当てはめると効率的です。`fit_value.py` は `web/js/value.js` を上書きします（numpy が必要です）。
+
+## ニューラルネットの局面評価を学習する
+
+```bash
+mkdir -p /tmp/nndata
+node tools/gen_nn.mjs 3000 1 > /tmp/nndata/d1.jsonl
+python3 tools/train_nn.py /tmp/nndata /tmp/nn-value.js --hidden 64,32 --epochs 15
+```
+
+- `gen_nn.mjs` の第3引数に `'{"level":"normal"}'` を渡すと、「ふつう」同士の対局で約10倍速くデータを作れます。
+- `--init 既存の重み.js --lr 0.0003` で、既存の重みからの追加学習になります。
+- 自己対戦での比較は、`'{"nn":1,"nnFile":"/tmp/nn-value.js"}'` のように重みファイルを指定します。
 
 ## GitHub Pages で公開する
 

@@ -1,6 +1,7 @@
 // Match self-play (first to TARGET points): node tools/match.mjs MATCHES A B SEED ['{A params}'] ['{B params}'] [TARGET]
 // Levels: strong | normal | easy | v1. Each match is played twice with swapped seats and the same decks.
 // Reports A's match win rate with a 95% confidence interval.
+import { makeNN } from '../web/js/nn.js';
 import { GinMatch, makeRng } from '../web/js/engine.js';
 import { decide as decideNew, DEFAULT_PARAMS } from '../web/js/ai.js';
 import { decide as decideV1, DEFAULT_PARAMS as V1_PARAMS } from './baseline/ai_v1.js';
@@ -11,6 +12,10 @@ const B = process.argv[4] || 'normal';
 const seed = +(process.argv[5] || 1);
 const overA = process.argv[6] ? JSON.parse(process.argv[6]) : {};
 const overB = process.argv[7] ? JSON.parse(process.argv[7]) : {};
+// {"nnFile": "path/to/nn-value.js"} loads alternative neural-network weights
+for (const o of [overA, overB]) {
+  if (o.nnFile) { const m = await import(new URL(o.nnFile, 'file://' + process.cwd() + '/').href); o.nnModel = makeNN(m.NN_LAYERS, m.NN_SCALE); delete o.nnFile; }
+}
 const target = +(process.argv[8] || 100);
 // fixed sample counts instead of a time budget, so results do not depend on machine load
 const BENCH = { timeBudget: 0, searchMin: 200, drawSearchMin: 200, mctsMin: 3000 };

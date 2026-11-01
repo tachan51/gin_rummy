@@ -1,5 +1,6 @@
 // Self-play harness: node tools/selfplay.mjs [hands] [A] [B] [seed] ['{"param":value}' for A]
 // A/B: strong (search) | normal (heuristic = former strongest) | easy (greedy) | v1 (frozen first release)
+import { makeNN } from '../web/js/nn.js';
 import { GinHand, makeRng } from '../web/js/engine.js';
 import { decide as decideNew, DEFAULT_PARAMS } from '../web/js/ai.js';
 import { decide as decideV1, DEFAULT_PARAMS as V1_PARAMS } from './baseline/ai_v1.js';
@@ -12,6 +13,10 @@ const B = process.argv[4] || 'normal';
 const seed = +(process.argv[5] || 1);
 const overA = process.argv[6] ? JSON.parse(process.argv[6]) : {};
 const overB = process.argv[7] ? JSON.parse(process.argv[7]) : {};
+// {"nnFile": "path/to/nn-value.js"} loads alternative neural-network weights
+for (const o of [overA, overB]) {
+  if (o.nnFile) { const m = await import(new URL(o.nnFile, 'file://' + process.cwd() + '/').href); o.nnModel = makeNN(m.NN_LAYERS, m.NN_SCALE); delete o.nnFile; }
+}
 // {"valueFile": "path/to/value.js"} loads alternative leaf-value weights
 for (const o of [overA, overB]) {
   if (o.valueFile) { o.valueW = (await import(new URL(o.valueFile, 'file://' + process.cwd() + '/').href)).VALUE_W; delete o.valueFile; }
