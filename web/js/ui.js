@@ -6,7 +6,31 @@ import { decide } from './ai.js';
 
 const HUMAN = 0, AI = 1;
 const LEVEL_NAMES = { easy: 'よわい', normal: 'ふつう', strong: '最強' };
-const AI_DELAY = 650;
+// A whole AI turn (draw + discard, thinking included) takes about 0.5 s at normal speed:
+// each action waits max(thinking time, AI_WAIT).
+const AI_WAIT = 240;
+
+// AI runs in a Web Worker so the page stays responsive; falls back to the main thread.
+let worker = null;
+let reqId = 0;
+const pending = new Map();
+try {
+  worker = new Worker(new URL('./ai-worker.js', import.meta.url), { type: 'module' });
+  worker.onmessage = (e) => { const p = pending.get(e.data.id); if (p) { pending.delete(e.data.id); p(e.data.action); } };
+  worker.onerror = () => { worker = null; for (const [, p] of pending) p(null); pending.clear(); };
+} catch { worker = null; }
+function askAI(view, level) {
+  if (worker) {
+    return new Promise((resolve) => {
+      const id = ++reqId;
+      pending.set(id, (a) => resolve(a || decide(view, level)));
+      worker.postMessage({ id, view, level });
+    });
+  }
+  return Promise.resolve(decide(view, level));
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const nowMs = () => performance.now();
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -235,8 +259,7 @@ function promptTurn() {
     busy = true;
     setMessage('AIが考えています…');
     render();
-    const t = token;
-    setTimeout(() => { if (t === token) aiStep(); }, AI_DELAY / settings.speed);
+    aiStep();
     return;
   }
   busy = false;
@@ -281,19 +304,29 @@ function onCardClick(c) {
   else { selected = c; render(); }
 }
 
-function aiStep() {
+async function aiStep() {
+  const t = token;
   const view = hand.view(AI);
-  const a = decide(view, settings.level);
+  const t0 = nowMs();
+  const a = await askAI(view, settings.level);
+  const thinkMs = nowMs() - t0;
+  (window.__aiThinkMs ||= []).push(Math.round(thinkMs)); // for diagnostics / tests
+  const rest = AI_WAIT / settings.speed - thinkMs;
+  if (rest > 0) await sleep(rest);
+  if (t !== token) return;
   const card = doAction(AI, a);
   if (a.type === 'take') setMessage(`AIは捨て札の ${cardName(card)} を取りました。`);
   else if (a.type === 'stock') setMessage('AIは山札から引きました。');
   else if (a.type === 'pass') setMessage(`AIは表札 ${cardName(view.discardPile[view.discardPile.length - 1])} をパスしました。`);
   else if (a.type === 'discard') setMessage(`AIは ${cardName(a.card)} を捨てました。${a.knock ? 'ノック！' : ''}`);
   render();
-  if (hand.phase === 'over') { const t = token; setTimeout(() => { if (t === token) finishHand(); }, AI_DELAY / settings.speed); return; }
+  if (hand.phase === 'over') {
+    await sleep(AI_WAIT / settings.speed);
+    if (t === token) finishHand();
+    return;
+  }
   if (hand.turn === AI) {
-    const t = token;
-    setTimeout(() => { if (t === token) aiStep(); }, AI_DELAY / settings.speed);
+    aiStep();
   } else {
     busy = false;
     const last = message;
@@ -302,9 +335,14 @@ function aiStep() {
   }
 }
 
-function showHint() {
-  const v = hand.view(HUMAN);
-  const a = decide(v, 'strong');
+async function showHint() {
+  const t = token;
+  const h = hand;
+  hintText = 'ヒント: 考えています…';
+  render();
+  const v = h.view(HUMAN);
+  const a = await askAI(v, 'strong');
+  if (t !== token || h !== hand || hand.turn !== HUMAN || hand.phase !== v.phase || hand.hands[HUMAN].length !== v.hand.length) return;
   hintCard = null;
   if (a.type === 'take') hintText = `ヒント: 捨て札の ${cardName(hand.top())} を取る`;
   else if (a.type === 'pass') hintText = 'ヒント: パス';
@@ -468,7 +506,7 @@ function showSettings() {
       </label>
     </div>
     <p class="stats">通算成績: ${Object.entries(LEVEL_NAMES).map(([k, n]) => `${n} ${(stats[k] || { w: 0 }).w}勝${(stats[k] || { l: 0 }).l}敗`).join(' / ')}</p>
-    <p class="stats">「最強」AIは、出たカードを全て記憶し、相手が拾った札・捨てた札から手札を推測。次の1枚で手がどれだけ良くなるかの期待値と、捨て札が相手に使われる危険度を計算し、ノックはアンダーカットの確率をシミュレーションして判断します。</p>`;
+    <p class="stats">「最強」AIは、出たカードを全て記憶して相手の手札を推測し、ありうる相手の手札と山札の並びを数百通り仮定して相手の次の手番までシミュレーションします。その局面を、AI同士の数万局の対戦から学習した評価式で採点して、最も得点が期待できる手を選びます（1手あたり約0.2秒以内）。</p>`;
   $('setLevel').value = settings.level;
   $('setTarget').value = String(settings.target);
   $('setSpeed').value = String(settings.speed);

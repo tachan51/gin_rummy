@@ -1,7 +1,10 @@
 // Self-play harness: node tools/selfplay.mjs [hands] [A] [B] [seed] ['{"param":value}' for A]
-// A/B: strong | normal | easy
+// A/B: strong | v1 | normal | easy
 import { GinHand, makeRng } from '../web/js/engine.js';
-import { decide, DEFAULT_PARAMS } from '../web/js/ai.js';
+import { decide as decideNew, DEFAULT_PARAMS } from '../web/js/ai.js';
+import { decide as decideV1, DEFAULT_PARAMS as V1_PARAMS } from './baseline/ai_v1.js';
+// level 'v1' = frozen first release of the strong AI (benchmark)
+const decide = (view, level, params, rng) => (level === 'v1' ? decideV1(view, 'strong', V1_PARAMS, rng) : decideNew(view, level, params, rng));
 
 const N = +(process.argv[2] || 200);
 const A = process.argv[3] || 'strong';
@@ -9,8 +12,14 @@ const B = process.argv[4] || 'normal';
 const seed = +(process.argv[5] || 1);
 const overA = process.argv[6] ? JSON.parse(process.argv[6]) : {};
 const overB = process.argv[7] ? JSON.parse(process.argv[7]) : {};
-const PA = { ...DEFAULT_PARAMS, ...overA };
-const PB = { ...DEFAULT_PARAMS, ...overB };
+// {"valueFile": "path/to/value.js"} loads alternative leaf-value weights
+for (const o of [overA, overB]) {
+  if (o.valueFile) { o.valueW = (await import(new URL(o.valueFile, 'file://' + process.cwd() + '/').href)).VALUE_W; delete o.valueFile; }
+}
+// fixed sample counts instead of a time budget, so results do not depend on machine load
+const BENCH = { timeBudget: 0, searchMin: 300, drawSearchMin: 300 };
+const PA = { ...DEFAULT_PARAMS, ...BENCH, ...overA };
+const PB = { ...DEFAULT_PARAMS, ...BENCH, ...overB };
 
 const rng = makeRng(seed);
 const players = [
@@ -32,10 +41,10 @@ for (let i = 0; i < N; i++) {
       const t0 = performance.now();
       const a = decide(h.view(h.turn), pl.level, pl.params, pl.rng);
       const dt = performance.now() - t0;
-      if (pl.level === "strong") { maxMs = Math.max(maxMs, dt); totMs += dt; nDec++; }
+      if (pl.level !== "normal" && pl.level !== "easy") { maxMs = Math.max(maxMs, dt); totMs += dt; nDec++; }
       h.apply(a);
     }
-    const r = h.result;
+    const r = h.result || { type: 'draw', winner: -1, points: 0 };
     types[r.type] = (types[r.type] || 0) + 1;
     if (r.winner < 0) { draws++; continue; }
     const who = seatOf(r.winner);

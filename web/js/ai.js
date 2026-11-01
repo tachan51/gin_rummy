@@ -12,7 +12,8 @@
 //  * knock decision: Monte-Carlo samples of the opponent hand (simulated from their draw history,
 //    respecting known cards) to estimate the undercut risk and the expected knock gain.
 
-import { VAL, suitOf, rankOf, deadwood, discardDeadwoods, defenderResult, arrange, KNOCK_LIMIT, makeRng } from './engine.js';
+import { VALUE_W } from './value.js';
+import { VAL, suitOf, rankOf, deadwood, discardDeadwoods, defenderResult, arrange, scoreHand, shuffle, KNOCK_LIMIT, makeRng } from './engine.js';
 
 export const DEFAULT_PARAMS = {
   alpha: 1.2, // weight of draw potential
@@ -28,6 +29,20 @@ export const DEFAULT_PARAMS = {
   lateStock: 8, // with this few stock cards or less: knock more readily
   ginHunt: 0, // if > 0, don't knock with deadwood above this (0 = disabled)
   deepK: 0, // 2-ply lookahead over this many best discards (0 = off)
+  threatSamples: 40, // opponent-hand samples used to estimate the knock threat
+  threatDW: 10, // opponent deadwood counted as "can knock soon"
+  threatAlpha: 0, // potential weight is reduced by this * threat
+  knockChoice: 1, // choose the knock discard by expected knock result
+  search: 1, // use the search for discard/knock decisions
+  searchCands: 4, // heuristic discard candidates examined by the search
+  searchMin: 60, // minimum sampled worlds
+  searchMax: 4000, // maximum sampled worlds
+  timeBudget: 170, // ms per search (stops after the minimum once exceeded); a whole AI turn stays around 0.5 s
+  drawSearch: 1, // also search the draw decision
+  drawSearchMin: 60, // minimum sampled worlds for the draw decision
+  innerKnockSamples: 20, // knock samples for hypothetical hands inside the draw search
+  takeGainW: 1, // value of taking the opponent's discard next turn
+  gamma: 0.0, // extra deadwood weight * threat (defence)
 };
 
 // ---------------------------------------------------------------------------
@@ -109,8 +124,10 @@ function alphaEff(P, K) {
 /** Evaluate a 10-card hand (lower is better). */
 export function evalHand(hand, K, P, level = 2) {
   const dw = deadwood(hand);
-  const a = alphaEff(P, K);
-  if (a === 0) return dw;
+  const th = K.threat || 0;
+  const base = dw * (1 + P.gamma * th);
+  const a = alphaEff(P, K) * Math.max(0, 1 - P.threatAlpha * th);
+  if (a === 0) return base;
   const h = BUF11[level];
   const out = OUT[level];
   for (let i = 0; i < 10; i++) h[i] = hand[i];
@@ -127,7 +144,7 @@ export function evalHand(hand, K, P, level = 2) {
       pot += pc * g;
     }
   }
-  return dw - a * pot;
+  return base - a * pot;
 }
 
 /**
@@ -191,18 +208,41 @@ function sampleOpponentHand(K, rng) {
   return hand;
 }
 
-export function knockStats(hand10, K, P, rng) {
-  const myArr = arrange(hand10);
-  const mydw = myArr.dw;
-  let under = 0, ev = 0;
-  const n = P.samples;
-  for (let i = 0; i < n; i++) {
-    const oh = sampleOpponentHand(K, rng);
-    const def = defenderResult(oh, myArr.melds, true);
-    if (def.dw <= mydw) { under++; ev -= 25 + (mydw - def.dw); }
-    else ev += def.dw - mydw;
+/** Opponent-hand samples (cached per decision). */
+function oppSamples(K, n, rng) {
+  if (!K._samples) K._samples = [];
+  while (K._samples.length < n) K._samples.push(sampleOpponentHand(K, rng));
+  return K._samples.slice(0, n);
+}
+
+/** Probability that the opponent is close to knocking (and their mean deadwood). */
+export function estimateThreat(K, P, rng) {
+  const S = oppSamples(K, P.threatSamples, rng);
+  let close = 0, sum = 0;
+  for (const oh of S) {
+    const d = deadwood(oh);
+    sum += d;
+    if (d <= P.threatDW) close++;
   }
-  return { pUndercut: under / n, ev: ev / n, dw: mydw };
+  return { threat: close / S.length, oppDW: sum / S.length };
+}
+
+export function knockStats(hand10, K, P, rng) {
+  const S = oppSamples(K, P.samples, rng);
+  let under = 0, ev = 0, mydw = 0;
+  for (const oh of S) {
+    const r = scoreHand([hand10, oh], 0, false);
+    mydw = r.knockerDW;
+    if (r.winner === 0) ev += r.points;
+    else { under++; ev -= r.points; }
+  }
+  return { pUndercut: under / S.length, ev: ev / S.length, dw: mydw };
+}
+
+function knockOk(st, K, P) {
+  if (st.dw === 0) return true;
+  if (K.stockCount <= P.lateStock) return st.ev > -5;
+  return st.pUndercut <= P.undercutMax && st.ev >= P.knockEvMin;
 }
 
 function shouldKnock(hand10, K, P, rng) {
@@ -210,9 +250,7 @@ function shouldKnock(hand10, K, P, rng) {
   if (dw === 0) return true;
   if (dw > KNOCK_LIMIT) return false;
   if (P.ginHunt > 0 && dw > P.ginHunt && K.stockCount > P.lateStock) return false;
-  const st = knockStats(hand10, K, P, rng);
-  if (K.stockCount <= P.lateStock) return st.ev > -5;
-  return st.pUndercut <= P.undercutMax && st.ev >= P.knockEvMin;
+  return knockOk(knockStats(hand10, K, P, rng), K, P);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +258,18 @@ function shouldKnock(hand10, K, P, rng) {
 // ---------------------------------------------------------------------------
 export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
   const K = analyze(view);
+  if (P.gamma || P.threatAlpha) Object.assign(K, estimateThreat(K, P, rng));
   const dangerCache = {};
   const hand = view.hand;
 
   if (view.phase === 'upcard' || view.phase === 'draw') {
     if (view.mustStock) return { type: 'stock' };
     const top = view.discardPile[view.discardPile.length - 1];
+    if (P.search && P.drawSearch) {
+      const takeIt = searchDraw(view, K, P, rng, dangerCache);
+      if (view.phase === 'upcard') return { type: takeIt ? 'take' : 'pass' };
+      return { type: takeIt ? 'take' : 'stock' };
+    }
     // value of taking the upcard
     const h11 = hand.concat([top]);
     const take = bestDiscard(h11, K, P, top, 0, dangerCache);
@@ -255,9 +299,23 @@ export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
       if (hand[k] === view.takenCard) continue;
       if (kIdx < 0 || out[k] < out[kIdx] || (out[k] === out[kIdx] && VAL[hand[k]] > VAL[hand[kIdx]])) kIdx = k;
     }
+    if (out[kIdx] === 0) return { type: 'discard', card: hand[kIdx], knock: true };
+    if (P.search) return searchDiscard(view, K, P, rng, dangerCache);
     if (out[kIdx] <= KNOCK_LIMIT) {
-      const rest = hand.filter((_, i) => i !== kIdx);
-      if (shouldKnock(rest, K, P, rng)) return { type: 'discard', card: hand[kIdx], knock: true };
+      if (P.ginHunt > 0 && out[kIdx] > P.ginHunt && K.stockCount > P.lateStock) { /* keep playing */ }
+      else if (P.knockChoice) {
+        // compare every knockable discard by its expected knock result
+        let best = null;
+        for (let k = 0; k < 11; k++) {
+          if (hand[k] === view.takenCard || out[k] > KNOCK_LIMIT) continue;
+          const st = knockStats(hand.filter((_, i) => i !== k), K, P, rng);
+          if (!best || st.ev > best.st.ev) best = { k, st };
+        }
+        if (knockOk(best.st, K, P)) return { type: 'discard', card: hand[best.k], knock: true };
+      } else {
+        const rest = hand.filter((_, i) => i !== kIdx);
+        if (shouldKnock(rest, K, P, rng)) return { type: 'discard', card: hand[kIdx], knock: true };
+      }
     }
     // evaluate all discards at the top level
     const scored = scoreDiscards(hand, K, P, view.takenCard, dangerCache);
@@ -298,6 +356,185 @@ function scoreDiscards(hand11, K, P, forbidden, dangerCache) {
   }
   res.sort((a, b) => a.score - b.score);
   return res;
+}
+
+// ---------------------------------------------------------------------------
+// Search: sample opponent hands + stock orders, simulate the opponent's reply
+// turn, and score the resulting position with a value model learned from
+// self-play (web/js/value.js). Knock options are scored exactly.
+// ---------------------------------------------------------------------------
+const COMBOS = (() => {
+  const out = [];
+  const rec = (start, d, acc) => {
+    if (acc.length === d) { out.push(acc.slice()); return; }
+    for (let i = start; i < 3; i++) { acc.push(i); rec(i, d, acc); acc.pop(); }
+  };
+  for (let d = 1; d <= 4; d++) rec(0, d, []);
+  return out;
+})();
+export function leafValue(e, o, s, W = VALUE_W) {
+  if (e < -15) e = -15; else if (e > 70) e = 70;
+  if (o > 100) o = 100;
+  const x = [e / 20, o / 20, s / 10];
+  let v = W[0];
+  for (let i = 0; i < COMBOS.length; i++) {
+    let f = 1;
+    const cmb = COMBOS[i];
+    for (let j = 0; j < cmb.length; j++) f *= x[cmb[j]];
+    v += W[i + 1] * f;
+  }
+  const n = COMBOS.length + 1;
+  if (e <= 10) v += W[n];
+  if (o <= 10) v += W[n + 1];
+  if (e <= 0) v += W[n + 2];
+  return v;
+}
+
+const SOUT = new Int32Array(32);
+const SH11 = new Array(11);
+/**
+ * Simulate the opponent's turn (greedy: take the discard if it clearly helps, knock as soon as possible)
+ * and return my expected net points. myHand: my 10 cards, myEval/myDW: their heuristic value / deadwood.
+ */
+function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
+  const oh = oppHand;
+  for (let i = 0; i < 10; i++) SH11[i] = oh[i];
+  // take decision
+  SH11[10] = top;
+  const before = deadwood(oh);
+  discardDeadwoods(SH11, SOUT);
+  let m = 1e9;
+  for (let k = 0; k < 10; k++) if (SOUT[k] < m) m = SOUT[k];
+  let taken = -1;
+  if (m < before - 2 || (m <= KNOCK_LIMIT && before > KNOCK_LIMIT)) taken = top;
+  else {
+    if (stock.length === 0) return 0;
+    SH11[10] = stock[stock.length - 1];
+    discardDeadwoods(SH11, SOUT);
+  }
+  let bk = -1;
+  for (let k = 0; k < 11; k++) {
+    if (SH11[k] === taken) continue;
+    if (bk < 0 || SOUT[k] < SOUT[bk] || (SOUT[k] === SOUT[bk] && VAL[SH11[k]] > VAL[SH11[bk]])) bk = k;
+  }
+  const oppDW = SOUT[bk];
+  const x = SH11[bk];
+  const stockLeft = stock.length - (taken < 0 ? 1 : 0);
+  if (oppDW <= KNOCK_LIMIT) {
+    const rest = [];
+    for (let k = 0; k < 11; k++) if (k !== bk) rest.push(SH11[k]);
+    const r = scoreHand([myHand, rest], 1, false);
+    return r.winner === 0 ? r.points : -r.points;
+  }
+  if (stockLeft <= 2) return 0;
+  // my next turn: I may take the opponent's discard x
+  for (let i = 0; i < 10; i++) SH11[i] = myHand[i];
+  SH11[10] = x;
+  let mm = 1e9;
+  discardDeadwoods(SH11, SOUT);
+  for (let k = 0; k < 10; k++) if (SOUT[k] < mm) mm = SOUT[k];
+  const e = mm < myDW ? Math.min(myEval, myEval - (myDW - mm) * P.takeGainW) : myEval;
+  return leafValue(e, oppDW, stockLeft, P.valueW || VALUE_W);
+}
+
+function sampleWorld(K, rng) {
+  const opp = sampleOpponentHand(K, rng);
+  const inOpp = new Set(opp);
+  const stock = shuffle(K.unseen.filter((c) => !inOpp.has(c)), rng);
+  return { opp, stock };
+}
+
+function now() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
+
+/** Search-based discard decision. Returns an action. */
+function searchDiscard(view, K, P, rng, dangerCache) {
+  const hand = view.hand;
+  const t0 = now();
+  const scored = scoreDiscards(hand, K, P, view.takenCard, dangerCache);
+  const cands = scored.slice(0, P.searchCands).map((sc) => {
+    const rest = hand.filter((c) => c !== sc.card);
+    return { card: sc.card, knock: false, rest, ev: evalHand(rest, K, P, 0), dw: deadwood(rest), sum: 0, n: 0 };
+  });
+  const out = new Int32Array(32);
+  discardDeadwoods(hand, out);
+  for (let k = 0; k < 11; k++) {
+    if (hand[k] === view.takenCard || out[k] > KNOCK_LIMIT) continue;
+    cands.push({ card: hand[k], knock: true, rest: hand.filter((_, i) => i !== k), sum: 0, n: 0 });
+  }
+  if (cands.length === 1) return { type: 'discard', card: cands[0].card, knock: cands[0].knock };
+  const pile = view.discardPile;
+  for (let w = 0; w < P.searchMax; w++) {
+    if (w >= P.searchMin && now() - t0 > P.timeBudget) break;
+    const W = sampleWorld(K, rng);
+    for (const cd of cands) {
+      let v;
+      if (cd.knock) {
+        const r = scoreHand([cd.rest, W.opp], 0, false);
+        v = r.winner === 0 ? r.points : -r.points;
+      } else {
+        v = simOppTurn(cd.rest, cd.ev, cd.dw, W.opp, cd.card, W.stock, P);
+      }
+      cd.sum += v; cd.n++;
+    }
+  }
+  let best = null;
+  for (const cd of cands) {
+    const m = cd.sum / cd.n + (cd.knock ? 0 : 0);
+    if (!best || m > best.m) best = { m, cd };
+  }
+  return { type: 'discard', card: best.cd.card, knock: best.cd.knock };
+}
+
+/**
+ * The heuristic policy's choice for an 11-card hand (used inside the draw search).
+ * Returns {card, knock, rest, ev, dw}.
+ */
+function policyChoice(h11, forbidden, K, P, rng, dangerCache) {
+  const out = new Int32Array(32);
+  discardDeadwoods(h11, out);
+  let kIdx = -1;
+  for (let k = 0; k < 11; k++) {
+    if (h11[k] === forbidden) continue;
+    if (kIdx < 0 || out[k] < out[kIdx] || (out[k] === out[kIdx] && VAL[h11[k]] > VAL[h11[kIdx]])) kIdx = k;
+  }
+  if (out[kIdx] <= KNOCK_LIMIT) {
+    const rest = h11.filter((_, i) => i !== kIdx);
+    const Pk = Object.assign({}, P, { samples: P.innerKnockSamples });
+    if (out[kIdx] === 0 || knockOk(knockStats(rest, K, Pk, rng), K, P)) return { card: h11[kIdx], knock: true, rest };
+  }
+  const best = scoreDiscards(h11, K, P, forbidden, dangerCache)[0];
+  const rest = h11.filter((c) => c !== best.card);
+  return { card: best.card, knock: false, rest, ev: evalHand(rest, K, P, 0), dw: deadwood(rest) };
+}
+
+function optionValue(opt, W, stock, P) {
+  if (opt.knock) {
+    const r = scoreHand([opt.rest, W.opp], 0, false);
+    return r.winner === 0 ? r.points : -r.points;
+  }
+  return simOppTurn(opt.rest, opt.ev, opt.dw, W.opp, opt.card, stock, P);
+}
+
+/** Search-based draw decision: take the upcard vs draw from the stock. */
+function searchDraw(view, K, P, rng, dangerCache) {
+  const t0 = now();
+  const hand = view.hand;
+  const top = view.discardPile[view.discardPile.length - 1];
+  const takeOpt = policyChoice(hand.concat([top]), top, K, P, rng, dangerCache);
+  const stockOpts = new Map();
+  let sTake = 0, sStock = 0, n = 0;
+  for (let w = 0; w < P.searchMax; w++) {
+    if (w >= P.drawSearchMin && now() - t0 > P.timeBudget) break;
+    const W = sampleWorld(K, rng);
+    sTake += optionValue(takeOpt, W, W.stock, P);
+    const st = W.stock.slice();
+    const c = st.pop();
+    let opt = stockOpts.get(c);
+    if (!opt) { opt = policyChoice(hand.concat([c]), -1, K, P, rng, dangerCache); stockOpts.set(c, opt); }
+    sStock += optionValue(opt, W, st, P);
+    n++;
+  }
+  return sTake / n > sStock / n;
 }
 
 // ---------------------------------------------------------------------------
