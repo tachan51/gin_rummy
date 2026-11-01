@@ -7,6 +7,7 @@
 | `web/index.html`, `web/style.css` | 画面 |
 | `web/js/engine.js` | ルール（メルド探索、デッドウッド、付け札、得点、ハンド進行、マッチ） |
 | `web/js/ai.js` | AI（最強＝探索あり / ふつう＝ヒューリスティックのみ / よわい＝貪欲）。しくみは [algo.md](algo.md) |
+| `web/js/ismcts.js` | ISMCTS（オプション。既定では無効） |
 | `web/js/value.js` | 探索で使う局面評価モデルの係数（自動生成） |
 | `web/js/ai-worker.js` | AI を Web Worker で動かすための入口 |
 | `web/js/ui.js` | 画面の制御 |

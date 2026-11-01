@@ -41,4 +41,11 @@ for (let seed = 1; seed <= 30; seed++) {
   let n = 0;
   while (h.phase !== 'over') { h.apply(decide(h.view(h.turn), seed % 3 === 0 ? 'easy' : 'strong', FAST, makeRng(seed + n))); n++; assert.ok(n < 200); }
 }
+// ISMCTS option (off by default) also plays legal moves
+const MCTS = { ...FAST, mcts: 1, mctsMin: 200 };
+for (let seed = 1; seed <= 5; seed++) {
+  const h = new GinHand({ dealer: seed % 2, rng: makeRng(seed) });
+  let n = 0;
+  while (h.phase !== 'over') { h.apply(decide(h.view(h.turn), 'strong', MCTS, makeRng(seed + n))); n++; assert.ok(n < 200); }
+}
 console.log('all tests passed');
