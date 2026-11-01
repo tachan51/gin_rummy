@@ -13,6 +13,7 @@
 //    respecting known cards) to estimate the undercut risk and the expected knock gain.
 
 import { VALUE_W } from './value.js';
+import { ismctsDecide } from './ismcts.js';
 import { VAL, suitOf, rankOf, deadwood, discardDeadwoods, defenderResult, arrange, scoreHand, shuffle, KNOCK_LIMIT, makeRng } from './engine.js';
 
 export const DEFAULT_PARAMS = {
@@ -42,6 +43,14 @@ export const DEFAULT_PARAMS = {
   drawSearchMin: 60, // minimum sampled worlds for the draw decision
   innerKnockSamples: 20, // knock samples for hypothetical hands inside the draw search
   takeGainW: 1, // value of taking the opponent's discard next turn
+  mcts: 0, // 1: use ISMCTS (ismcts.js) for draw / discard decisions (no measurable gain, off)
+  mctsMin: 100, // minimum iterations
+  mctsMax: 100000, // maximum iterations
+  mctsCands: 3, // own discard candidates per tree node (besides knock)
+  mctsOppCands: 3, // opponent discard candidates per tree node (besides knock)
+  uctC: 0.7, // exploration constant
+  mctsScale: 25, // value scale (points) used in UCT
+  mctsOppGreedy: 0, // 1: opponent nodes follow a fixed greedy policy instead of UCT
   gamma: 0.0, // extra deadwood weight * threat (defence)
 };
 
@@ -265,6 +274,7 @@ export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
   if (view.phase === 'upcard' || view.phase === 'draw') {
     if (view.mustStock) return { type: 'stock' };
     const top = view.discardPile[view.discardPile.length - 1];
+    if (P.mcts && view.phase === 'draw') return ismctsDecide(view, K, P, rng, dangerCache);
     if (P.search && P.drawSearch) {
       const takeIt = searchDraw(view, K, P, rng, dangerCache);
       if (view.phase === 'upcard') return { type: takeIt ? 'take' : 'pass' };
@@ -300,6 +310,7 @@ export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
       if (kIdx < 0 || out[k] < out[kIdx] || (out[k] === out[kIdx] && VAL[hand[k]] > VAL[hand[kIdx]])) kIdx = k;
     }
     if (out[kIdx] === 0) return { type: 'discard', card: hand[kIdx], knock: true };
+    if (P.mcts) return ismctsDecide(view, K, P, rng, dangerCache);
     if (P.search) return searchDiscard(view, K, P, rng, dangerCache);
     if (out[kIdx] <= KNOCK_LIMIT) {
       if (P.ginHunt > 0 && out[kIdx] > P.ginHunt && K.stockCount > P.lateStock) { /* keep playing */ }
@@ -342,7 +353,7 @@ export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
 }
 
 /** All legal discards scored by the heuristic, best first. */
-function scoreDiscards(hand11, K, P, forbidden, dangerCache) {
+export function scoreDiscards(hand11, K, P, forbidden, dangerCache) {
   const res = [];
   const rest = new Array(10);
   for (let k = 0; k < 11; k++) {
@@ -396,7 +407,7 @@ const SH11 = new Array(11);
  * Simulate the opponent's turn (greedy: take the discard if it clearly helps, knock as soon as possible)
  * and return my expected net points. myHand: my 10 cards, myEval/myDW: their heuristic value / deadwood.
  */
-function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
+export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
   const oh = oppHand;
   for (let i = 0; i < 10; i++) SH11[i] = oh[i];
   // take decision
@@ -437,14 +448,14 @@ function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
   return leafValue(e, oppDW, stockLeft, P.valueW || VALUE_W);
 }
 
-function sampleWorld(K, rng) {
+export function sampleWorld(K, rng) {
   const opp = sampleOpponentHand(K, rng);
   const inOpp = new Set(opp);
   const stock = shuffle(K.unseen.filter((c) => !inOpp.has(c)), rng);
   return { opp, stock };
 }
 
-function now() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
+export function now() { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
 
 /** Search-based discard decision. Returns an action. */
 function searchDiscard(view, K, P, rng, dangerCache) {
@@ -574,7 +585,7 @@ export function decideGreedy(view, rng = Math.random, noise = 0) {
 }
 
 /** Settings for the "normal" level: the first-release strong AI (heuristic only, no search). */
-export const NORMAL_OVERRIDES = { search: 0, knockChoice: 0 };
+export const NORMAL_OVERRIDES = { search: 0, knockChoice: 0, mcts: 0 };
 
 /**
  * level: 'strong' (search + learned value model), 'normal' (heuristic, the former strongest AI),

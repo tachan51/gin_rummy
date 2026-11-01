@@ -17,7 +17,7 @@ for (const o of [overA, overB]) {
   if (o.valueFile) { o.valueW = (await import(new URL(o.valueFile, 'file://' + process.cwd() + '/').href)).VALUE_W; delete o.valueFile; }
 }
 // fixed sample counts instead of a time budget, so results do not depend on machine load
-const BENCH = { timeBudget: 0, searchMin: 300, drawSearchMin: 300 };
+const BENCH = { timeBudget: 0, searchMin: 300, drawSearchMin: 300, mctsMin: 3000 };
 const PA = { ...DEFAULT_PARAMS, ...BENCH, ...overA };
 const PB = { ...DEFAULT_PARAMS, ...BENCH, ...overB };
 
