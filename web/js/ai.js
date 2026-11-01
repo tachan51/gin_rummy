@@ -14,6 +14,7 @@
 
 import { VALUE_W } from './value.js';
 import { ismctsDecide } from './ismcts.js';
+import { matchUtility } from './match-equity.js';
 import { VAL, suitOf, rankOf, deadwood, discardDeadwoods, defenderResult, arrange, scoreHand, shuffle, KNOCK_LIMIT, makeRng } from './engine.js';
 
 export const DEFAULT_PARAMS = {
@@ -51,6 +52,8 @@ export const DEFAULT_PARAMS = {
   uctC: 0.7, // exploration constant
   mctsScale: 25, // value scale (points) used in UCT
   mctsOppGreedy: 0, // 1: opponent nodes follow a fixed greedy policy instead of UCT
+  matchAwareFrom: 0, // ... only once either player has at least this many points
+  matchAware: 0, // 1: use the match score (view.match) to value outcomes by match-winning probability
   gamma: 0.0, // extra deadwood weight * threat (defence)
 };
 
@@ -266,6 +269,11 @@ function shouldKnock(hand10, K, P, rng) {
 // Main decision
 // ---------------------------------------------------------------------------
 export function decideStrong(view, P = DEFAULT_PARAMS, rng = Math.random) {
+  // match-aware: compare outcomes by match-winning probability instead of hand points
+  if (P.matchAware && view.match && P.search && Math.max(view.match.myScore, view.match.oppScore) >= P.matchAwareFrom) {
+    const m = view.match;
+    P = { ...P, util: matchUtility(m.myScore, m.oppScore, m.target, view.dealer === view.me) };
+  }
   const K = analyze(view);
   if (P.gamma || P.threatAlpha) Object.assign(K, estimateThreat(K, P, rng));
   const dangerCache = {};
@@ -419,7 +427,7 @@ export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
   let taken = -1;
   if (m < before - 2 || (m <= KNOCK_LIMIT && before > KNOCK_LIMIT)) taken = top;
   else {
-    if (stock.length === 0) return 0;
+    if (stock.length === 0) return P.util ? P.util(0) : 0;
     SH11[10] = stock[stock.length - 1];
     discardDeadwoods(SH11, SOUT);
   }
@@ -435,9 +443,10 @@ export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
     const rest = [];
     for (let k = 0; k < 11; k++) if (k !== bk) rest.push(SH11[k]);
     const r = scoreHand([myHand, rest], 1, false);
-    return r.winner === 0 ? r.points : -r.points;
+    const v = r.winner === 0 ? r.points : -r.points;
+    return P.util ? P.util(v) : v;
   }
-  if (stockLeft <= 2) return 0;
+  if (stockLeft <= 2) return P.util ? P.util(0) : 0;
   // my next turn: I may take the opponent's discard x
   for (let i = 0; i < 10; i++) SH11[i] = myHand[i];
   SH11[10] = x;
@@ -445,7 +454,8 @@ export function simOppTurn(myHand, myEval, myDW, oppHand, top, stock, P) {
   discardDeadwoods(SH11, SOUT);
   for (let k = 0; k < 10; k++) if (SOUT[k] < mm) mm = SOUT[k];
   const e = mm < myDW ? Math.min(myEval, myEval - (myDW - mm) * P.takeGainW) : myEval;
-  return leafValue(e, oppDW, stockLeft, P.valueW || VALUE_W);
+  const lv = leafValue(e, oppDW, stockLeft, P.valueW || VALUE_W);
+  return P.util ? P.util.leaf(lv) : lv;
 }
 
 export function sampleWorld(K, rng) {
@@ -482,6 +492,7 @@ function searchDiscard(view, K, P, rng, dangerCache) {
       if (cd.knock) {
         const r = scoreHand([cd.rest, W.opp], 0, false);
         v = r.winner === 0 ? r.points : -r.points;
+        if (P.util) v = P.util(v);
       } else {
         v = simOppTurn(cd.rest, cd.ev, cd.dw, W.opp, cd.card, W.stock, P);
       }
@@ -521,7 +532,8 @@ function policyChoice(h11, forbidden, K, P, rng, dangerCache) {
 function optionValue(opt, W, stock, P) {
   if (opt.knock) {
     const r = scoreHand([opt.rest, W.opp], 0, false);
-    return r.winner === 0 ? r.points : -r.points;
+    const v = r.winner === 0 ? r.points : -r.points;
+    return P.util ? P.util(v) : v;
   }
   return simOppTurn(opt.rest, opt.ev, opt.dw, W.opp, opt.card, stock, P);
 }

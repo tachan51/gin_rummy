@@ -305,9 +305,16 @@ function onCardClick(c) {
   else { selected = c; render(); }
 }
 
+/** Hand view plus the match score, so the AI can play for the match (first to the target). */
+function viewFor(p) {
+  const v = hand.view(p);
+  v.match = { myScore: match.scores[p], oppScore: match.scores[1 - p], target: match.target };
+  return v;
+}
+
 async function aiStep() {
   const t = token;
-  const view = hand.view(AI);
+  const view = viewFor(AI);
   const t0 = nowMs();
   const a = await askAI(view, settings.level);
   const thinkMs = nowMs() - t0;
@@ -341,7 +348,7 @@ async function showHint() {
   const h = hand;
   hintText = 'ヒント: 考えています…';
   render();
-  const v = h.view(HUMAN);
+  const v = viewFor(HUMAN);
   const a = await askAI(v, 'strong');
   if (t !== token || h !== hand || hand.turn !== HUMAN || hand.phase !== v.phase || hand.hands[HUMAN].length !== v.hand.length) return;
   hintCard = null;
