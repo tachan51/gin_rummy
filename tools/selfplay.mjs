@@ -1,5 +1,5 @@
 // Self-play harness: node tools/selfplay.mjs [hands] [A] [B] [seed] ['{"param":value}' for A]
-// A/B: strong | v1 | normal | easy
+// A/B: strong (search) | normal (heuristic = former strongest) | easy (greedy) | v1 (frozen first release)
 import { GinHand, makeRng } from '../web/js/engine.js';
 import { decide as decideNew, DEFAULT_PARAMS } from '../web/js/ai.js';
 import { decide as decideV1, DEFAULT_PARAMS as V1_PARAMS } from './baseline/ai_v1.js';

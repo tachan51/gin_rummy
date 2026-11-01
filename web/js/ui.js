@@ -39,7 +39,8 @@ const store = {
 };
 
 const settings = Object.assign({ level: 'strong', target: 100, sort: 'meld', showAI: false, speed: 1 }, store.get('settings', {}));
-let stats = store.get('stats', {});
+// level meanings changed in v2 (easy/normal/strong were re-assigned), so records start fresh
+let stats = store.get('stats2', {});
 
 let match = null;
 let hand = null;
@@ -450,7 +451,7 @@ function showFinal() {
   const s = stats[key] || { w: 0, l: 0 };
   if (f.winner === HUMAN) s.w++; else s.l++;
   stats[key] = s;
-  store.set('stats', stats);
+  store.set('stats2', stats);
   const st = document.createElement('p');
   st.className = 'stats';
   st.textContent = `対「${LEVEL_NAMES[key]}」通算: ${s.w}勝 ${s.l}敗`;

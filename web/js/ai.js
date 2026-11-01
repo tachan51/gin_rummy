@@ -573,8 +573,16 @@ export function decideGreedy(view, rng = Math.random, noise = 0) {
   return { type: 'discard', card: hand[best], knock: out[best] <= KNOCK_LIMIT };
 }
 
+/** Settings for the "normal" level: the first-release strong AI (heuristic only, no search). */
+export const NORMAL_OVERRIDES = { search: 0, knockChoice: 0 };
+
+/**
+ * level: 'strong' (search + learned value model), 'normal' (heuristic, the former strongest AI),
+ *        'easy' (greedy deadwood minimisation)
+ */
 export function decide(view, level = 'strong', params, rng) {
-  if (level === 'easy') return decideGreedy(view, rng || Math.random, 0.35);
-  if (level === 'normal') return decideGreedy(view, rng || Math.random, 0);
-  return decideStrong(view, params || DEFAULT_PARAMS, rng || makeRng((Math.random() * 2 ** 32) >>> 0));
+  if (level === 'easy') return decideGreedy(view, rng || Math.random, 0);
+  const r = rng || makeRng((Math.random() * 2 ** 32) >>> 0);
+  if (level === 'normal') return decideStrong(view, { ...(params || DEFAULT_PARAMS), ...NORMAL_OVERRIDES }, r);
+  return decideStrong(view, params || DEFAULT_PARAMS, r);
 }
